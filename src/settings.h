@@ -6,7 +6,7 @@
 #define CLIENT_TOPIC_SUFFIX "_client"
 #define GROUP_TOPIC_SUFFIX "_group"
 #define QOS 2
-#define MAX_ID_LEN 20
+#define MAX_ID_LEN 100 
 #define MAX_MESSAGE_LEN 100
 #define MAX_CONCURRENT_CONVERSATIONS 10
 #define MAX_GROUP_TOPIC_LEN 100

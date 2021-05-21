@@ -19,6 +19,11 @@ typedef struct {
 typedef struct {
 	char topic[MAX_ID_LEN];
 	char with[MAX_ID_LEN];
+} ConversationHeader;
+
+typedef struct {
+	char topic[MAX_ID_LEN];
+	char with[MAX_ID_LEN];
 	int begin;
 	int messagesCount;
 	Message messages[MAX_MESSAGES_HISTORY];
@@ -33,6 +38,8 @@ struct ZapersonClient_s {
 
 typedef struct ZapersonClient_s ZapersonClient;
 
+bool setupFinished = false;
+
 int selector = 0;
 bool home = true;
 
@@ -41,7 +48,7 @@ const char **groups;
 
 pthread_mutex_t conversationsMutex = PTHREAD_MUTEX_INITIALIZER;
 int conversationsCount;
-Conversation conversations[MAX_CONCURRENT_CONVERSATIONS]; 
+Conversation conversations[MAX_CONCURRENT_CONVERSATIONS];
 void redraw();
 
 char *combineStr(const char first[], const char second[]) {
@@ -66,80 +73,113 @@ bool canAddConversation() {
 	return result;
 }
 
-bool tryAddConversation(const char with[], const char topic[]) {
-	bool result;
-
+void addConversation(ConversationHeader *ch) {
 	pthread_mutex_lock(&conversationsMutex);
-	if (conversationsCount < MAX_CONCURRENT_CONVERSATIONS) {
-		strcpy(conversations[conversationsCount].topic, topic);
-		strcpy(conversations[conversationsCount].with, with);
-		conversations[conversationsCount].begin = 0;
-		conversations[conversationsCount].messagesCount = 0;
-		conversationsCount++;
-		result = true;
-	} else {
-		result = false;
-	}
+	strcpy(conversations[conversationsCount].topic, ch->topic);
+	strcpy(conversations[conversationsCount].with, ch->with);
+	conversations[conversationsCount].begin = 0;
+	conversations[conversationsCount].messagesCount = 0;
+	conversationsCount++;
 	pthread_mutex_unlock(&conversationsMutex);
-
 	redraw();
-
-	return result;
 }
 
+void stopUI();
 void onConnLost(void *context, char *cause) {
-	fprintf(stderr, "onConnLost cause: %s\n", cause);
 
 	MQTTAsync_connectOptions connOpts = MQTTAsync_connectOptions_initializer;
 	connOpts.cleansession = 0;
 
 	int rc;
 	if ((rc = MQTTAsync_connect(my.MQTTClient, &connOpts)) != MQTTASYNC_SUCCESS) {
-		fprintf(stderr, "Reconnection fail, return code %d\n", rc);
+		stopUI();
+		printf("Failed to start sendMessage, return code %d\n", rc);
+		exit(EXIT_FAILURE);
+	}
+}
+
+void addConversationToList(void *context, MQTTAsync_successData *response) {
+	ConversationHeader *ch = context;
+	addConversation(ch);
+	free(ch);
+}
+
+void freeConversationHeader(void *context, MQTTAsync_failureData *response) {
+	ConversationHeader *ch = context;
+	free(ch);
+}
+
+void sendConversationTopicToOther(void *context,
+		MQTTAsync_successData *response) {
+
+	ConversationHeader *ch = context;
+
+	char payload[300];
+	sprintf(payload, "%s\31%s", my.clientID, ch->topic);
+
+	MQTTAsync_responseOptions opts = MQTTAsync_responseOptions_initializer;
+	opts.context = ch;
+	opts.onSuccess = addConversationToList;
+	opts.onFailure = freeConversationHeader;
+
+	MQTTAsync_message msg = MQTTAsync_message_initializer;
+	msg.payload = payload;
+	msg.payloadlen = strlen(payload);
+	msg.qos = QOS;
+
+	char otherClientTopic[300];
+	sprintf(otherClientTopic, "%s%s", ch->with, CLIENT_TOPIC_SUFFIX);
+
+	int rc;
+	if ((rc = MQTTAsync_sendMessage(my.MQTTClient, otherClientTopic, &msg,
+					&opts)) != MQTTASYNC_SUCCESS) {
+		stopUI();
+		printf("Failed to start sendMessage, return code %d\n", rc);
+		exit(EXIT_FAILURE);
 	}
 }
 
 void handleCtrlMsg(MQTTAsync_message *ctrlMsg) {
+	if (!canAddConversation())
+		return;
 
-	char *otherId = ctrlMsg->payload;
+	ConversationHeader *ch = malloc(sizeof(ConversationHeader));
 
-	char cnvrstnTopic[MAX_CONVERSETION_TOPIC_LEN];
-	sprintf(cnvrstnTopic, "%s_%s_%d", otherId, my.clientID, rand() % 10000);
+	strcpy(ch->with, ctrlMsg->payload);
+	sprintf(ch->topic, "%s_%s_%d", ch->with, my.clientID, rand() % 10000);
 
-	char otherClientTopic[40];
-	sprintf(otherClientTopic, "%s%s", otherId, CLIENT_TOPIC_SUFFIX);
+	char otherClientTopic[300];
+	sprintf(otherClientTopic, "%s%s", ch->with, CLIENT_TOPIC_SUFFIX);
 
-	if (tryAddConversation(otherId, cnvrstnTopic)) {
-		int rc;
-		if ((rc = MQTTAsync_subscribe(my.MQTTClient, cnvrstnTopic, QOS, NULL)) !=
-				MQTTASYNC_SUCCESS) {
-		}
+	MQTTAsync_responseOptions opts = MQTTAsync_responseOptions_initializer;
+	opts.context = ch;
+	opts.onSuccess = sendConversationTopicToOther;
+	opts.onFailure = freeConversationHeader;
 
-		char payload[100];
-		sprintf(payload, "%s\31%s", my.clientID, cnvrstnTopic);
-
-		MQTTAsync_message msg = MQTTAsync_message_initializer;
-		msg.payload = payload;
-		msg.payloadlen = strlen(payload);
-		msg.qos = QOS;
-
-		if ((rc = MQTTAsync_sendMessage(my.MQTTClient, otherClientTopic, &msg,
-						NULL)) != MQTTASYNC_SUCCESS) {
-		}
+	int rc;
+	if ((rc = MQTTAsync_subscribe(my.MQTTClient, ch->topic, QOS, &opts)) !=
+			MQTTASYNC_SUCCESS) {
+		stopUI();
+		printf("Failed to start subscribe, return code %d\n", rc);
+		exit(EXIT_FAILURE);
 	}
 }
 
 void handleClientMsg(MQTTAsync_message *clientMsg) {
-	char cnvrstnTopic[100];
-	char otherClientID[100];
+	ConversationHeader *ch = malloc(sizeof(ConversationHeader));
+	sscanf(clientMsg->payload, "%[^\31]\31%[^\n]", ch->with, ch->topic);
 
-	sscanf(clientMsg->payload, "%[^\31]\31%[^\n]", otherClientID, cnvrstnTopic);
-
+	MQTTAsync_responseOptions opts = MQTTAsync_responseOptions_initializer;
+	opts.context = ch;
+	opts.onSuccess = addConversationToList;
+	opts.onFailure = freeConversationHeader;
 	int rc;
-	if ((rc = MQTTAsync_subscribe(my.MQTTClient, cnvrstnTopic, QOS, NULL)) !=
+	if ((rc = MQTTAsync_subscribe(my.MQTTClient, ch->topic, QOS, &opts)) !=
 			MQTTASYNC_SUCCESS) {
+		stopUI();
+		printf("Failed to start subscribe, return code %d\n", rc);
+		exit(EXIT_FAILURE);
 	}
-	tryAddConversation(otherClientID, cnvrstnTopic);
 }
 
 void addMessageToConversation(char *from, char *msg, Conversation *cnvrstn) {
@@ -156,8 +196,8 @@ void addMessageToConversation(char *from, char *msg, Conversation *cnvrstn) {
 }
 
 void handleUserMsg(char topicName[], MQTTAsync_message *msg) {
-	char from[MAX_ID_LEN];	
-	char content[MAX_MESSAGE_LEN]; 
+	char from[MAX_ID_LEN];
+	char content[MAX_MESSAGE_LEN];
 
 	sscanf(msg->payload, "%[^\31]\31%[^\n]", from, content);
 
@@ -187,27 +227,81 @@ int onMsgArrvd(void *context, char *topicName, int topicLen,
 	return 1;
 }
 
-void onDiscSucc(void *context, MQTTAsync_successData *response) {
-	fprintf(stderr, "onDiscSucc\n");
-}
-
 void onStartConnFail(void *context, MQTTAsync_failureData *response) {
-	printf("onConnFail rc %d\n", response ? response->code : 0);
+	printf("Failed to connect to server %s, rc: %d, message: %s\n", SERVER_URI,
+			response->code,
+			response->message != NULL ? response->message : "No message");
 	exit(EXIT_FAILURE);
 }
 
-void onSubSucc(void *context, MQTTAsync_successData *response) {
-	printf("onSubSucc\n");
+void onClientSubFail(void *context, MQTTAsync_failureData *response) {
+	printf("Failed to subscribe client topic, rc: %d, message: %s\n",
+			response->code,
+			response->message != NULL ? response->message : "No message");
+	exit(EXIT_FAILURE);
 }
 
-void onSubFail(void *context, MQTTAsync_failureData *response) {
-	printf("onSubFail rc %d\n", response ? response->code : 0);
+void onGroupSubSucc(void *context, MQTTAsync_successData *response) {
+	ConversationHeader *ch = context;
+	addConversation(ch);
+	free(ch);
 }
 
+void onGroupSubFail(void *context, MQTTAsync_failureData *response) {
+	ConversationHeader *ch = context;
+	free(ch);
+}
+
+// subscrite to groups topics
+void onClientSubSucc(void *context, MQTTAsync_successData *response) {
+	setupFinished = true;
+
+	MQTTAsync_responseOptions respOpts = MQTTAsync_responseOptions_initializer;
+	respOpts.onSuccess = onGroupSubSucc;
+	respOpts.onFailure = onGroupSubFail;
+
+	groupsCount = MIN(groupsCount, MAX_CONCURRENT_CONVERSATIONS);
+	for (int i = 0; i < groupsCount; i++) {
+		ConversationHeader *ch = malloc(sizeof(ConversationHeader));
+		sprintf(ch->topic, "%s%s", groups[i], GROUP_TOPIC_SUFFIX);
+		strcpy(ch->with, groups[i]);
+		respOpts.context = ch;
+
+		int rc;
+		if ((rc = MQTTAsync_subscribe(my.MQTTClient, ch->topic, QOS, &respOpts)) !=
+				MQTTASYNC_SUCCESS) {
+			printf("Failed to start subscribe to group topic, return code %d\n", rc);
+			exit(EXIT_FAILURE);
+		}
+	}
+}
+
+// subscribe to client topic
+void onCtrlSubSucc(void *context, MQTTAsync_successData *response) {
+	MQTTAsync_responseOptions respOpts = MQTTAsync_responseOptions_initializer;
+	respOpts.onSuccess = onClientSubSucc;
+	respOpts.onFailure = onClientSubFail;
+
+	int rc;
+	if ((rc = MQTTAsync_subscribe(my.MQTTClient, my.clientTopic, QOS,
+					&respOpts)) != MQTTASYNC_SUCCESS) {
+		printf("Failed to start subscribe to client topic, return code %d\n", rc);
+		exit(EXIT_FAILURE);
+	}
+}
+
+void onCtrlSubFail(void *context, MQTTAsync_failureData *response) {
+	printf("Failed to subscribe control topic, rc: %d, message: %s\n",
+			response->code,
+			response->message != NULL ? response->message : "No message");
+	exit(EXIT_FAILURE);
+}
+
+// subscribe to ctrl topic
 void onStartConnSucc(void *context, MQTTAsync_successData *response) {
 	MQTTAsync_responseOptions respOpts = MQTTAsync_responseOptions_initializer;
-	respOpts.onSuccess = onSubSucc;
-	respOpts.onFailure = onSubFail;
+	respOpts.onSuccess = onCtrlSubSucc;
+	respOpts.onFailure = onCtrlSubFail;
 
 	int rc;
 	if ((rc = MQTTAsync_subscribe(my.MQTTClient, my.ctrlTopic, QOS, &respOpts)) !=
@@ -215,67 +309,33 @@ void onStartConnSucc(void *context, MQTTAsync_successData *response) {
 		printf("Failed to start subscribe to ctrl topic, return code %d\n", rc);
 		exit(EXIT_FAILURE);
 	}
-	if ((rc = MQTTAsync_subscribe(my.MQTTClient, my.clientTopic, QOS,
-					&respOpts)) != MQTTASYNC_SUCCESS) {
-		printf("Failed to start subscribe to client topic, return code %d\n", rc);
-		exit(EXIT_FAILURE);
-	}
-
-	char groupTopic[MAX_GROUP_TOPIC_LEN];
-	for (int i = 0; i < MIN(groupsCount, MAX_CONCURRENT_CONVERSATIONS); i++) {
-		sprintf(groupTopic, "%s_%s", groups[i], GROUP_TOPIC_SUFFIX);
-		if ((rc = MQTTAsync_subscribe(my.MQTTClient, groupTopic, QOS, &respOpts)) !=
-				MQTTASYNC_SUCCESS) {
-			printf("Failed to start subscribe to group topic, return code %d\n", rc);
-			exit(EXIT_FAILURE);
-		}
-		tryAddConversation(groups[i], groupTopic);
-	}
 }
 
-void onDelivCmplt(void *context, MQTTAsync_token token) {
-	fprintf(stderr, "onDelivCmplt\n");
-}
+void stopUI() { endwin(); }
 
-void disconect(ZapersonClient *my) {
-	MQTTAsync_disconnectOptions discOpts =
-		MQTTAsync_disconnectOptions_initializer;
-	discOpts.onSuccess = onDiscSucc;
+void requestNewConversationWith(char otherId[]) {
+	if (!canAddConversation())
+		return;
+
+	char *otherCtrlTopic = combineStr(otherId, CTRL_TOPIC_SUFFIX);
+
+	MQTTAsync_message msg = MQTTAsync_message_initializer;
+	msg.payload = (void *)my.clientID;
+	msg.payloadlen = strlen(my.clientID);
+	msg.qos = QOS;
+
 	int rc;
-	if ((rc = MQTTAsync_disconnect(my->MQTTClient, &discOpts)) !=
+	if ((rc = MQTTAsync_sendMessage(my.MQTTClient, otherCtrlTopic, &msg, NULL)) !=
 			MQTTASYNC_SUCCESS) {
-		fprintf(stderr, "Failed to start disconnect, return code %d\n", rc);
+		stopUI();
+		printf("Failed to start sendMessage, return code %d\n", rc);
 		exit(EXIT_FAILURE);
 	}
-	MQTTAsync_destroy(&(my->MQTTClient));
+
+	free(otherCtrlTopic);
 }
 
-void onSendFailure(void *context, MQTTAsync_failureData *response) {
-	fprintf(stderr, "onSendFailure\n");
-}
-
-void createNewConversation(char otherId[]) {
-	if (canAddConversation()) {
-		char *otherCtrlTopic = combineStr(otherId, CTRL_TOPIC_SUFFIX);
-
-		MQTTAsync_message msg = MQTTAsync_message_initializer;
-		msg.payload = (void *)my.clientID;
-		msg.payloadlen = strlen(my.clientID) + 1;
-		msg.qos = QOS;
-
-		MQTTAsync_responseOptions opts = MQTTAsync_responseOptions_initializer;
-		opts.onFailure = onSendFailure;
-
-		int rc;
-		if ((rc = MQTTAsync_sendMessage(my.MQTTClient, otherCtrlTopic, &msg,
-						&opts)) != MQTTASYNC_SUCCESS) {
-			fprintf(stderr, "Failed to start sendMessage, return code %d\n", rc);
-			exit(EXIT_FAILURE);
-		}
-	}
-}
-
-char buf[100] = "";
+char buf[MAX_MESSAGE_LEN] = "";
 
 void cleanBuf() { buf[0] = '\0'; }
 
@@ -283,7 +343,7 @@ void goToChat() { home = false; }
 
 void handleEnterHome() {
 	if (strlen(buf) > 0) {
-		createNewConversation(buf);
+		requestNewConversationWith(buf);
 		cleanBuf();
 	} else {
 		if (conversationsCount > 0)
@@ -294,9 +354,9 @@ void handleEnterHome() {
 void sendMessage() {
 	char *chatTopic = conversations[selector].topic;
 
-	char payload[200];
+	char payload[300];
 
-	sprintf(payload, "%s\31%s", my.clientID, buf); 
+	sprintf(payload, "%s\31%s", my.clientID, buf);
 
 	MQTTAsync_message msg = MQTTAsync_message_initializer;
 	msg.payload = payload;
@@ -306,6 +366,9 @@ void sendMessage() {
 	int rc;
 	if ((rc = MQTTAsync_sendMessage(my.MQTTClient, chatTopic, &msg, NULL)) !=
 			MQTTASYNC_SUCCESS) {
+		stopUI();
+		printf("Failed to start sendMessage, return code %d\n", rc);
+		exit(EXIT_FAILURE);
 	}
 
 	cleanBuf();
@@ -324,35 +387,35 @@ void handleEnter() {
 	}
 }
 
-void waitInput() {
-	int ch;
-	while (true) {
-		move(LINES - 3, 3 + strlen(buf));
-		ch = getch();
-		if (ch == ERR)
-			continue;
+void draw();
 
-		if (ch == KEY_UP || ch == 259) {
-			selector = MAX(selector - 1, 0);
-		} else if (ch == KEY_DOWN || ch == 258) {
-			selector = MIN(selector + 1, conversationsCount - 1);
-		} else if (ch == KEY_EXIT || ch == 27) {
-			if (!home) {
-				home = true;
-			}
-		} else if (ch == KEY_ENTER || ch == 10) {
-			handleEnter();
-		} else if (ch == KEY_BACKSPACE || ch == 127) {
-			if (strlen(buf) > 0)
-				buf[strlen(buf) - 1] = '\0';
-		} else if (isprint(ch)) {
-			char c = ch;
-			strncat(buf, &c, 1);
-		} else {
-			continue;
+void waitInputAndRedraw() {
+	int ch;
+	move(LINES - 3, 3 + strlen(buf));
+	ch = getch();
+	if (ch == ERR)
+		return;
+
+	if (ch == KEY_UP || ch == 259) {
+		selector = MAX(selector - 1, 0);
+	} else if (ch == KEY_DOWN || ch == 258) {
+		selector = MIN(selector + 1, conversationsCount - 1);
+	} else if (ch == KEY_EXIT || ch == 27) {
+		if (!home) {
+			home = true;
 		}
-		redraw();
+	} else if (ch == KEY_ENTER || ch == 10) {
+		handleEnter();
+	} else if (ch == KEY_BACKSPACE || ch == 127) {
+		if (strlen(buf) > 0)
+			buf[strlen(buf) - 1] = '\0';
+	} else if (isprint(ch)) {
+		char c = ch;
+		strncat(buf, &c, 1);
+	} else {
+		return;
 	}
+	redraw();
 }
 
 void drawBox(int y, int x, int length, int height) {
@@ -417,18 +480,15 @@ void redraw() {
 	draw();
 }
 
-void setupZapersonClient() {
-	MQTTAsync_create(&my.MQTTClient, SERVER_URI, my.clientID,
-			MQTTCLIENT_PERSISTENCE_NONE, NULL);
-	MQTTAsync_setCallbacks(my.MQTTClient, NULL, onConnLost, onMsgArrvd, NULL);
-
-	MQTTAsync_connectOptions connOpts = MQTTAsync_connectOptions_initializer;
-	connOpts.onSuccess = onStartConnSucc;
-	connOpts.onFailure = onStartConnFail;
-	int rc;
-	if ((rc = MQTTAsync_connect(my.MQTTClient, &connOpts)) != MQTTASYNC_SUCCESS) {
-		printf("Failed to start connect, return code %d\n", rc);
-		exit(EXIT_FAILURE);
+void initUI() {
+	initscr();
+	cbreak();
+	timeout(33);
+	noecho();
+	keypad(stdscr, true);
+	draw();
+	while (true) {
+		waitInputAndRedraw();
 	}
 }
 
@@ -445,25 +505,23 @@ int main(int argc, const char *argv[]) {
 	my.ctrlTopic = combineStr(my.clientID, CTRL_TOPIC_SUFFIX);
 	my.clientTopic = combineStr(my.clientID, CLIENT_TOPIC_SUFFIX);
 
-	printf("Starting zaperson for %s\n", my.clientID);
-	if (groupsCount == 0) {
-		printf("Joining no groups\n");
-	} else {
-		printf("Joining %d group(s)\n", groupsCount);
+	MQTTAsync_create(&my.MQTTClient, SERVER_URI, my.clientID,
+			MQTTCLIENT_PERSISTENCE_NONE, NULL);
+	MQTTAsync_setCallbacks(my.MQTTClient, NULL, onConnLost, onMsgArrvd, NULL);
+	MQTTAsync_connectOptions connOpts = MQTTAsync_connectOptions_initializer;
+	connOpts.cleansession = 1;
+	connOpts.onSuccess = onStartConnSucc;
+	connOpts.onFailure = onStartConnFail;
+
+	int rc;
+	if ((rc = MQTTAsync_connect(my.MQTTClient, &connOpts)) != MQTTASYNC_SUCCESS) {
+		printf("Failed to start connection, return code %d\n", rc);
+		exit(EXIT_FAILURE);
 	}
 
-	setupZapersonClient();
-
-	sleep(3);
-
-	initscr();
-	cbreak();
-	timeout(10);
-	noecho();
-	keypad(stdscr, true);
-	while (true) {
-		redraw();
-		waitInput();
+	while (!setupFinished) {
+		sleep(1);
 	}
-	endwin();
+
+	initUI();
 }
