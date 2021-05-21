@@ -6,8 +6,8 @@ MKDIR_P = mkdir -p
 RM = rm -f 
 TARGET = zaperson
 CC = gcc
-CFLAG = -Wall -Wextra
-CLIBS = -lpaho-mqtt3as
+CFLAG = -Wall 
+CLIBS = -lpaho-mqtt3as -lncurses
 
 $(TARGET): $(OBJ)
 	$(CC) $(CFLAG) $^ -o $@ $(CLIBS) 
@@ -23,3 +23,4 @@ run: $(TARGET)
 
 clean:
 	$(RM) $(TARGET) $(OBJ) 
+
