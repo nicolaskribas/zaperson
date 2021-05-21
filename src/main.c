@@ -41,8 +41,7 @@ const char **groups;
 
 pthread_mutex_t conversationsMutex = PTHREAD_MUTEX_INITIALIZER;
 int conversationsCount;
-Conversation conversations[MAX_CONCURRENT_CONVERSATIONS];
-
+Conversation conversations[MAX_CONCURRENT_CONVERSATIONS]; 
 void redraw();
 
 char *combineStr(const char first[], const char second[]) {
@@ -116,9 +115,12 @@ void handleCtrlMsg(MQTTAsync_message *ctrlMsg) {
 				MQTTASYNC_SUCCESS) {
 		}
 
+		char payload[100];
+		sprintf(payload, "%s\31%s", my.clientID, cnvrstnTopic);
+
 		MQTTAsync_message msg = MQTTAsync_message_initializer;
-		msg.payload = cnvrstnTopic;
-		msg.payloadlen = strlen(cnvrstnTopic);
+		msg.payload = payload;
+		msg.payloadlen = strlen(payload);
 		msg.qos = QOS;
 
 		if ((rc = MQTTAsync_sendMessage(my.MQTTClient, otherClientTopic, &msg,
@@ -128,12 +130,16 @@ void handleCtrlMsg(MQTTAsync_message *ctrlMsg) {
 }
 
 void handleClientMsg(MQTTAsync_message *clientMsg) {
-	char *cnvrstnTopic = clientMsg->payload;
+	char cnvrstnTopic[100];
+	char otherClientID[100];
+
+	sscanf(clientMsg->payload, "%[^\31]\31%[^\n]", otherClientID, cnvrstnTopic);
+
 	int rc;
 	if ((rc = MQTTAsync_subscribe(my.MQTTClient, cnvrstnTopic, QOS, NULL)) !=
 			MQTTASYNC_SUCCESS) {
 	}
-	tryAddConversation("", cnvrstnTopic);
+	tryAddConversation(otherClientID, cnvrstnTopic);
 }
 
 void addMessageToConversation(char *from, char *msg, Conversation *cnvrstn) {
@@ -150,10 +156,15 @@ void addMessageToConversation(char *from, char *msg, Conversation *cnvrstn) {
 }
 
 void handleUserMsg(char topicName[], MQTTAsync_message *msg) {
+	char from[MAX_ID_LEN];	
+	char content[MAX_MESSAGE_LEN]; 
+
+	sscanf(msg->payload, "%[^\31]\31%[^\n]", from, content);
+
 	pthread_mutex_lock(&conversationsMutex);
 	for (int i = 0; i < conversationsCount; i++) {
 		if (strcmp(topicName, conversations[i].topic) == 0) {
-			addMessageToConversation("nsei ainda", msg->payload, &conversations[i]);
+			addMessageToConversation(from, content, &conversations[i]);
 			break;
 		}
 	}
@@ -283,9 +294,13 @@ void handleEnterHome() {
 void sendMessage() {
 	char *chatTopic = conversations[selector].topic;
 
+	char payload[200];
+
+	sprintf(payload, "%s\31%s", my.clientID, buf); 
+
 	MQTTAsync_message msg = MQTTAsync_message_initializer;
-	msg.payload = buf;
-	msg.payloadlen = strlen(buf);
+	msg.payload = payload;
+	msg.payloadlen = strlen(payload);
 	msg.qos = QOS;
 
 	int rc;
